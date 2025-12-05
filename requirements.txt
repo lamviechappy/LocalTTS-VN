@@ -16,5 +16,4 @@ diffusers==0.29.0
 resemble-perth==1.0.1
 spacy-pkuseg
 pykakasi==2.3.0
-russian-text-stresser @ git+https://github.com/Vuizur/add-stress-to-epub
 omegaconf==2.3.0
