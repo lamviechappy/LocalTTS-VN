@@ -36,6 +36,32 @@ REPO_ID = "dolly-vn/viterbox"
 WAVS_DIR = Path("wavs")
 
 
+# Global VAD model
+_VAD_MODEL = None
+_VAD_UTILS = None
+
+
+def get_vad_model():
+    """Load Silero VAD model (singleton)"""
+    global _VAD_MODEL, _VAD_UTILS
+    if _VAD_MODEL is None:
+        try:
+            # Load from torch hub - will be cached
+            model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                trust_repo=True,
+                verbose=False
+            )
+            _VAD_MODEL = model
+            _VAD_UTILS = utils
+        except Exception as e:
+            print(f"⚠️ Could not load Silero VAD: {e}")
+            return None, None
+    return _VAD_MODEL, _VAD_UTILS
+
+
 def get_random_voice() -> Optional[Path]:
     """Get a random voice file from wavs folder"""
     if WAVS_DIR.exists():
@@ -44,6 +70,46 @@ def get_random_voice() -> Optional[Path]:
             import random
             return random.choice(voices)
     return None
+
+
+def punc_norm(text: str) -> str:
+    """
+    Quick cleanup func for punctuation from LLMs or
+    containing chars not seen often in the dataset
+    """
+    if len(text) == 0:
+        return "You need to add some text for me to talk."
+
+    # Capitalise first letter
+    if len(text) > 0 and text[0].islower():
+        text = text[0].upper() + text[1:]
+
+    # Remove multiple space chars
+    text = " ".join(text.split())
+
+    # Replace uncommon/llm punc
+    punc_to_replace = [
+        ("...", ", "),
+        ("…", ", "),
+        (":", ","),
+        (" - ", ", "),
+        (";", ", "),
+        ("—", "-"),
+        ("–", "-"),
+        (" ,", ","),
+        ('"', '"'),
+        ("'", "'"),
+    ]
+    for old_char_sequence, new_char in punc_to_replace:
+        text = text.replace(old_char_sequence, new_char)
+
+    # Add full stop if no ending punc
+    text = text.rstrip(" ")
+    sentence_enders = {".", "!", "?", "-", ",", "、", "，", "。", "？", "！"}
+    if not any(text.endswith(p) for p in sentence_enders):
+        text += "."
+
+    return text
 
 
 def normalize_text(text: str, language: str = "vi") -> str:
@@ -82,9 +148,87 @@ def _split_text_to_sentences(text: str) -> List[str]:
 
 
 def trim_silence(audio: np.ndarray, sr: int, top_db: int = 30) -> np.ndarray:
-    """Trim silence from audio."""
+    """Legacy trim silence (energy based)."""
     trimmed, _ = librosa.effects.trim(audio, top_db=top_db)
     return trimmed
+
+
+def vad_trim(audio: np.ndarray, sr: int, margin_s: float = 0.01) -> np.ndarray:
+    """
+    Trim audio using Silero VAD to strictly keep only speech.
+    
+    Args:
+        audio: Audio array (numpy)
+        sr: Sample rate
+        margin_s: Margin to keep after speech ends (seconds)
+    """
+    if len(audio) == 0:
+        return audio
+        
+    model, utils = get_vad_model()
+    if model is None:
+        return trim_silence(audio, sr, top_db=20)
+        
+    (get_speech_timestamps, _, read_audio, *_) = utils
+    
+    # Prepare audio for VAD (must be float32)
+    wav = torch.tensor(audio, dtype=torch.float32)
+    
+    # If sampling rate is not 8k or 16k, we might need resample for VAD? 
+    # Silero supports 8000 or 16000 directly usually, but newer versions handle others.
+    # We will trust utils to handle or just pass as is (Silero supports 16k best).
+    
+    # Actually Silero expects simple tensor. Let's try direct.
+    # Note: Silero often works best at 16k.
+    
+    try:
+        # Get speech timestamps
+        # VAD typically expects 16000 sr. Let's resample strictly for detection if needed
+        # but let's try direct first. If sr is 24000, silero might warn.
+        # Safe bet: resample local copy for detection
+        
+        vad_sr = 16000
+        if sr != vad_sr:
+            # Quick resample for detection only
+            wav_16k = librosa.resample(audio, orig_sr=sr, target_sr=vad_sr)
+            wav_tensor = torch.tensor(wav_16k, dtype=torch.float32)
+        else:
+            wav_tensor = wav
+            
+        # Use VAD parameters
+        timestamps = get_speech_timestamps(
+            wav_tensor, 
+            model, 
+            sampling_rate=vad_sr, 
+            threshold=0.35,  # Relax threshold as we fixed the root cause
+            min_speech_duration_ms=250, 
+            min_silence_duration_ms=100
+        )
+        
+        if not timestamps:
+            # No speech detected? Fallback to mild energy trim or return as is?
+            # Sometimes VAD misses breathy endings. Let's fallback to energy trim
+            return trim_silence(audio, sr, top_db=25)
+            
+        # Get end of last speech chunk
+        last_end_sample_16k = timestamps[-1]['end']
+        
+        # Convert back to original sample rate
+        last_end_sample = int(last_end_sample_16k * (sr / vad_sr))
+        
+        # Add margin
+        margin_samples = int(margin_s * sr)
+        cut_point = last_end_sample + margin_samples
+        
+        # Don't cut beyond length
+        cut_point = min(cut_point, len(audio))
+        
+        # Trim
+        return audio[:cut_point]
+        
+    except Exception as e:
+        print(f"⚠️ VAD Error: {e}")
+        return trim_silence(audio, sr, top_db=20)
 
 
 def apply_fade_out(audio: np.ndarray, sr: int, fade_duration: float = 0.01) -> np.ndarray:
@@ -431,7 +575,9 @@ class Viterbox:
         top_p: float,
         repetition_penalty: float,
     ) -> np.ndarray:
-        """Generate speech for a single sentence."""
+        # Normalize and ensure text ends with punctuation (crucial for T3)
+        text = punc_norm(text)
+            
         # Tokenize text with language prefix
         text_tokens = self.tokenizer.text_to_tokens(text, language_id=language).to(self.device)
         
@@ -448,12 +594,12 @@ class Viterbox:
         use_autocast = self.device in ['cuda', 'mps']
         device_type = 'cuda' if self.device == 'cuda' else 'mps'
 
-        with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(self.device==use_autocast)):
+        with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.float16, enabled=(self.device==use_autocast)):
             # Generate speech tokens with T3
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=600,
+                max_new_tokens=1000,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 repetition_penalty=repetition_penalty,
@@ -463,14 +609,20 @@ class Viterbox:
             # Extract only the conditional batch and filter invalid tokens
             speech_tokens = speech_tokens[0]
             speech_tokens = drop_invalid_tokens(speech_tokens)
+            
+            # FIX (Root Cause): Remove the last token which often contains noise/transients
+            # causing click artifacts in S3 generation.
+            if len(speech_tokens) > 1:
+                speech_tokens = speech_tokens[:-1]
+                
             speech_tokens = speech_tokens.to(self.device)
         
-        # Generate waveform with S3Gen
-        wav, _ = self.s3gen.inference(
-            speech_tokens=speech_tokens,
-            ref_dict=self.conds.s3,
-        )
-        
+            # Generate waveform with S3Gen
+            wav, _ = self.s3gen.inference(
+                speech_tokens=speech_tokens,
+                ref_dict=self.conds.s3,
+            )
+            
         return wav[0].cpu().numpy()
     
     def generate(
@@ -481,8 +633,9 @@ class Viterbox:
         exaggeration: float = 0.5,
         cfg_weight: float = 0.5,
         temperature: float = 0.8,
-        top_p: float = 0.9,
-        repetition_penalty: float = 1.2,
+
+        top_p: float = 1.0,
+        repetition_penalty: float = 2.0,
         split_sentences: bool = True,
         crossfade_ms: int = 50,
         sentence_pause_ms: int = 500,
@@ -544,8 +697,9 @@ class Viterbox:
                     repetition_penalty=repetition_penalty,
                 )
                 
-                # Trim silence from each segment (use less aggressive threshold)
-                audio_np = trim_silence(audio_np, self.sr, top_db=20)
+                # Trim silence using VAD (more precise endpointing)
+                # Keep margin reasonable (50ms) as we prevent clicks at generation level now
+                audio_np = vad_trim(audio_np, self.sr, margin_s=0.05)
                 
                 # Apply fade-out to prevent click at end of each segment
                 audio_np = apply_fade_out(audio_np, self.sr, fade_duration=0.01)  # 10ms fade-out
