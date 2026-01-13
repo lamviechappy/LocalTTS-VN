@@ -23,9 +23,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=1.24.0,<1.26.0",
+    "numpy>=1.24.0,<2.4.0",
     "librosa==0.11.0",
-    "s3tokenizer",
+    "s3tokenizer==0.3.0",
     "torch==2.6.0",
     "torchaudio==2.6.0",
     "transformers==4.46.3",
@@ -36,12 +36,13 @@ dependencies = [
     "spacy-pkuseg",
     "pykakasi==2.3.0",
     "gradio==5.44.1",
-    "soe-vinorm>=0.3.2",
+    "soe-vinorm==0.3.2",
     "huggingface_hub>=0.20.0",
     "einops>=0.7.0",
     "soundfile>=0.12.0",
-    "streamlit>=1.52.2",
+    "streamlit==1.52.2",
     "onnx==1.18.0",
+    "onnxruntime==1.19.2",
 ]
 
 [project.optional-dependencies]
