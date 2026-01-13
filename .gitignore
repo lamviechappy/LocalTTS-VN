@@ -44,3 +44,11 @@ outputs/
 # MacOS
 *.DS_Store
 pretrained/
+
+backup/
+outputs/
+app_log.txt
+checkpoints/
+pretrained/
+voice_samples/*.wav
+!voice_samples/.gitkeep

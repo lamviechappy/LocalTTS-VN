@@ -1,5 +1,5 @@
 """
-Viterbox - Command Line Inference
+Command Line Inference
 """
 import argparse
 from pathlib import Path

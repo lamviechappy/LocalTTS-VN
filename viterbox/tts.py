@@ -1,5 +1,5 @@
 """
-Viterbox - Vietnamese Text-to-Speech
+Local Text-to-Speech
 Based on Chatterbox architecture, fine-tuned for Vietnamese.
 """
 import os
@@ -23,6 +23,12 @@ from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.voice_encoder import VoiceEncoder
 from .models.tokenizers import MTLTokenizer
 
+import config
+
+from config import OFFLINE_MODE
+from config import VAD_LOCAL_PATH, REPO_ID, USE_VAD, VAD_MIN_SILENCE_MS, VAD_MARGIN_MS, VAD_THRESHOLD, VAD_MIN_SPEECH_MS, VAD_TOP_DB
+from config import LOCAL_MODEL_DIR, LOCAL_MODEL_PATH, WAVS_DIR
+
 try:
     from soe_vinorm import SoeNormalizer
     _normalizer = SoeNormalizer()
@@ -32,35 +38,27 @@ except ImportError:
     _normalizer = None
 
 
-REPO_ID = "dolly-vn/viterbox"
-WAVS_DIR = Path("wavs")
-
-
 # Global VAD model
 _VAD_MODEL = None
 _VAD_UTILS = None
 
-
+# CODE MỚI V2
 def get_vad_model():
-    """Load Silero VAD model (singleton)"""
     global _VAD_MODEL, _VAD_UTILS
     if _VAD_MODEL is None:
-        try:
-            # Load from torch hub - will be cached
-            model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                trust_repo=True,
-                verbose=False
-            )
-            _VAD_MODEL = model
-            _VAD_UTILS = utils
-        except Exception as e:
-            print(f"⚠️ Could not load Silero VAD: {e}")
-            return None, None
+        # Nếu ở mode Offline hoặc file local tồn tại -> Dùng Local
+        if OFFLINE_MODE or os.path.exists(VAD_LOCAL_PATH):
+            _VAD_MODEL = torch.jit.load(VAD_LOCAL_PATH, map_location='cpu')
+            from silero_vad import get_speech_timestamps, save_audio, read_audio, collect_chunks
+            _VAD_UTILS = (get_speech_timestamps, save_audio, read_audio, collect_chunks)
+            print("✅ VAD loaded from Local SSD.")
+        else:
+            # Chỉ tải từ internet khi OFFLINE_MODE = False và không có file local
+            _VAD_MODEL, _VAD_UTILS = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
+            print("🌐 VAD loaded from GitHub.")
     return _VAD_MODEL, _VAD_UTILS
 
+# END CODE MỚI V2
 
 def get_random_voice() -> Optional[Path]:
     """Get a random voice file from wavs folder"""
@@ -152,84 +150,146 @@ def trim_silence(audio: np.ndarray, sr: int, top_db: int = 30) -> np.ndarray:
     trimmed, _ = librosa.effects.trim(audio, top_db=top_db)
     return trimmed
 
-
-def vad_trim(audio: np.ndarray, sr: int, margin_s: float = 0.01) -> np.ndarray:
-    """
-    Trim audio using Silero VAD to strictly keep only speech.
+# OLD VAD_TRIM
+# def vad_trim(audio: np.ndarray, sr: int, margin_s: float = 0.01) -> np.ndarray:
+#     """
+#     Trim audio using Silero VAD to strictly keep only speech.
     
-    Args:
-        audio: Audio array (numpy)
-        sr: Sample rate
-        margin_s: Margin to keep after speech ends (seconds)
-    """
-    if len(audio) == 0:
-        return audio
+#     Args:
+#         audio: Audio array (numpy)
+#         sr: Sample rate
+#         margin_s: Margin to keep after speech ends (seconds)
+#     """
+#     if len(audio) == 0:
+#         return audio
+    
+#     # --- THÊM LOGIC KIỂM TRA BẬT/TẮT ---
+#     if not USE_VAD:
+#         # Nếu tắt VAD, dùng hàm trim_silence cơ bản (energy-based) để tiết kiệm tài nguyên
+#         # hoặc trả về audio gốc nếu muốn giữ nguyên tuyệt đối
+#         return trim_silence(audio, sr, top_db=25) 
+    
+#     model, utils = get_vad_model()
+#     if model is None:
+#         return trim_silence(audio, sr, top_db=20)
         
+#     model, utils = get_vad_model()
+#     if model is None:
+#         return trim_silence(audio, sr, top_db=20)
+        
+#     (get_speech_timestamps, _, read_audio, *_) = utils
+    
+#     # Prepare audio for VAD (must be float32)
+#     wav = torch.tensor(audio, dtype=torch.float32)
+    
+#     # If sampling rate is not 8k or 16k, we might need resample for VAD? 
+#     # Silero supports 8000 or 16000 directly usually, but newer versions handle others.
+#     # We will trust utils to handle or just pass as is (Silero supports 16k best).
+    
+#     # Actually Silero expects simple tensor. Let's try direct.
+#     # Note: Silero often works best at 16k.
+    
+#     try:
+#         # Get speech timestamps
+#         # VAD typically expects 16000 sr. Let's resample strictly for detection if needed
+#         # but let's try direct first. If sr is 24000, silero might warn.
+#         # Safe bet: resample local copy for detection
+        
+#         vad_sr = 16000
+#         if sr != vad_sr:
+#             # Quick resample for detection only
+#             wav_16k = librosa.resample(audio, orig_sr=sr, target_sr=vad_sr)
+#             wav_tensor = torch.tensor(wav_16k, dtype=torch.float32)
+#         else:
+#             wav_tensor = wav
+            
+#         # Use VAD parameters
+#         timestamps = get_speech_timestamps(
+#             wav_tensor, 
+#             model, 
+#             sampling_rate=vad_sr, 
+#             threshold=0.35,  # Relax threshold as we fixed the root cause
+#             min_speech_duration_ms=250, 
+#             min_silence_duration_ms=100
+#         )
+        
+#         if not timestamps:
+#             # No speech detected? Fallback to mild energy trim or return as is?
+#             # Sometimes VAD misses breathy endings. Let's fallback to energy trim
+#             return trim_silence(audio, sr, top_db=25)
+            
+#         # Get end of last speech chunk
+#         last_end_sample_16k = timestamps[-1]['end']
+        
+#         # Convert back to original sample rate
+#         last_end_sample = int(last_end_sample_16k * (sr / vad_sr))
+        
+#         # Add margin
+#         margin_samples = int(margin_s * sr)
+#         cut_point = last_end_sample + margin_samples
+        
+#         # Don't cut beyond length
+#         cut_point = min(cut_point, len(audio))
+        
+#         # Trim
+#         return audio[:cut_point]
+        
+#     except Exception as e:
+#         print(f"⚠️ VAD Error: {e}")
+#         return trim_silence(audio, sr, top_db=20)
+# END OLD VAD TRIM
+
+# NEW VAD_TRIM
+def vad_trim(audio: np.ndarray, sr: int, margin_s: float = None) -> np.ndarray:
+    if len(audio) == 0 or not USE_VAD:
+        return audio
+
+    # Nếu tắt VAD từ config, trả về audio gốc ngay lập tức
+    if not config.USE_VAD:
+        return audio
+
+    # Xác định margin: Ưu tiên tham số truyền vào, nếu không có thì dùng config
+    if margin_s is None:
+        margin_s = config.VAD_MARGIN_MS / 1000  # # Đổi từ miliseconds sang seconds
+
     model, utils = get_vad_model()
     if model is None:
-        return trim_silence(audio, sr, top_db=20)
+        # Sử dụng top_db từ config nếu VAD không load dược
+        return trim_silence(audio, sr, top_db=VAD_TOP_DB)
         
-    (get_speech_timestamps, _, read_audio, *_) = utils
-    
-    # Prepare audio for VAD (must be float32)
-    wav = torch.tensor(audio, dtype=torch.float32)
-    
-    # If sampling rate is not 8k or 16k, we might need resample for VAD? 
-    # Silero supports 8000 or 16000 directly usually, but newer versions handle others.
-    # We will trust utils to handle or just pass as is (Silero supports 16k best).
-    
-    # Actually Silero expects simple tensor. Let's try direct.
-    # Note: Silero often works best at 16k.
+    (get_speech_timestamps, _, _, _) = utils
     
     try:
-        # Get speech timestamps
-        # VAD typically expects 16000 sr. Let's resample strictly for detection if needed
-        # but let's try direct first. If sr is 24000, silero might warn.
-        # Safe bet: resample local copy for detection
-        
         vad_sr = 16000
-        if sr != vad_sr:
-            # Quick resample for detection only
-            wav_16k = librosa.resample(audio, orig_sr=sr, target_sr=vad_sr)
-            wav_tensor = torch.tensor(wav_16k, dtype=torch.float32)
-        else:
-            wav_tensor = wav
+        # Resample để detect (giữ nguyên logic resample của bạn)
+        wav_16k = librosa.resample(audio, orig_sr=sr, target_sr=vad_sr)
+        wav_tensor = torch.tensor(wav_16k, dtype=torch.float32)
             
-        # Use VAD parameters
         timestamps = get_speech_timestamps(
             wav_tensor, 
             model, 
             sampling_rate=vad_sr, 
-            threshold=0.35,  # Relax threshold as we fixed the root cause
-            min_speech_duration_ms=250, 
-            min_silence_duration_ms=100
+            threshold=VAD_THRESHOLD, 
+            min_speech_duration_ms=VAD_MIN_SPEECH_MS, 
+            min_silence_duration_ms=VAD_MIN_SILENCE_MS
         )
         
         if not timestamps:
-            # No speech detected? Fallback to mild energy trim or return as is?
-            # Sometimes VAD misses breathy endings. Let's fallback to energy trim
-            return trim_silence(audio, sr, top_db=25)
+            # Nếu AI không tìm thấy tiếng người, dùng top_db dự phòng
+            return trim_silence(audio, sr, top_db=config.VAD_TOP_DB)
             
-        # Get end of last speech chunk
-        last_end_sample_16k = timestamps[-1]['end']
+        last_end_sample = int(timestamps[-1]['end'] * (sr / vad_sr))
         
-        # Convert back to original sample rate
-        last_end_sample = int(last_end_sample_16k * (sr / vad_sr))
-        
-        # Add margin
+        # Sử dụng Margin từ config
         margin_samples = int(margin_s * sr)
-        cut_point = last_end_sample + margin_samples
-        
-        # Don't cut beyond length
-        cut_point = min(cut_point, len(audio))
-        
-        # Trim
+        cut_point = min(last_end_sample + margin_samples, len(audio))
         return audio[:cut_point]
         
     except Exception as e:
         print(f"⚠️ VAD Error: {e}")
         return trim_silence(audio, sr, top_db=20)
 
+# END NEW VAD_TRIM
 
 def apply_fade_out(audio: np.ndarray, sr: int, fade_duration: float = 0.01) -> np.ndarray:
     """
@@ -413,6 +473,24 @@ class Viterbox:
         >>> tts.save_audio(audio, "output.wav")
     """
     
+    # def __init__(
+    #     self,
+    #     t3: T3,
+    #     s3gen: S3Gen,
+    #     ve: VoiceEncoder,
+    #     tokenizer: MTLTokenizer,
+    #     device: str = "cuda",
+    # ):
+    #     self.t3 = t3
+    #     self.s3gen = s3gen
+    #     self.ve = ve
+    #     self.tokenizer = tokenizer
+    #     self.device = device
+    #     self.sr = 24000  # Output sample rate
+    #     self.conds: Optional[TTSConds] = None
+
+    from config import USE_VAD  # Import từ file config bạn đã tạo
+    # NEW
     def __init__(
         self,
         t3: T3,
@@ -429,8 +507,17 @@ class Viterbox:
         self.sr = 24000  # Output sample rate
         self.conds: Optional[TTSConds] = None
         
+        # --- THÊM DÒNG NÀY ---
+        self.use_vad = USE_VAD 
+        if self.use_vad:
+            # Gọi hàm singleton đã sửa ở bước trước
+            self.vad_model, self.vad_utils = get_vad_model()
+        else:
+            self.vad_model, self.vad_utils = None, None
+    # END NEW
+        
     @classmethod
-    def from_pretrained(cls, device: str = "cuda") -> 'Viterbox':
+    def from_pretrained(cls, device: str = "cuda", repo_id: str = REPO_ID) -> 'Viterbox':
         """Load model from HuggingFace Hub to local pretrained directory"""
         # Tải về thư mục pretrained/ cục bộ trong dự án
         local_pretrained_dir = Path(__file__).parent.parent / "pretrained"
@@ -438,7 +525,7 @@ class Viterbox:
         
         ckpt_dir = Path(
             snapshot_download(
-                repo_id=REPO_ID,
+                repo_id=repo_id,
                 repo_type="model",
                 revision="main",
                 allow_patterns=[
